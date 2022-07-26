@@ -1,8 +1,13 @@
 import sys
+import time
 from os import path
+
 import redis
 import boto3
-import pandas as pd
+import dask.dataframe as dd
+import dask.multiprocessing
+from distributed import Client
+
 
 class FileHandler:
     def read(self, file_path):
@@ -13,7 +18,7 @@ class FileHandler:
 
 class LocalFileHandler(FileHandler):
     def read(self, file_path):
-        return pd.read_csv(file_path, sep=',"', engine='python', usecols=['"col10""'])
+        return dd.read_csv(file_path, sep='"",""', engine='python', usecols=['col10'], dtype=float)
 
     def exists(self, file_path):
         return path.exists(file_path)
@@ -28,27 +33,48 @@ class RemoteFileHandler(FileHandler):
 
     def read(self, file_path):
         file = RemoteFileHandler.s3.upload_file('tasks/'+file_path, 'BucketName', file_path)
-        return pd.read_csv(file)
+        return dd.read_csv(file)
 
     def exists(self, file_path):
         return path.exists(file_path)
 
-#calculate service
-def get_file(data):
-    s=sys.getsizeof(data)
-    print(s)
-    df = pd.to_numeric(data['"col10""'].str.strip('"')).sum()
-    return df
+
+def read_file(file_name):
+    start_time = time.time()
+    data = file_handler.read(file_name)
+    print(f"- {(time.time() - start_time)} seconds read -")
+    return data
+
+def get_sum(data):
+    data_size=sys.getsizeof(data)
+    sum_col10 = data['col10'].sum().compute()
+    print(f"- {data_size} size -")
+    return sum_col10
+
+def future(data):
+    start_time = time.time()
+    with dask.config.set({"optimization.fuse.active": True}):
+        big_future = client_dask.scatter(data)
+        results = client_dask.submit(get_sum, big_future)
+        print(f"- {results.result()} answer -")
+    print(f"- {(time.time() - start_time)} seconds calculate -")
+    return results
+
+def main():
+    with redis.Redis() as client:
+        while True:
+            file_name = client.brpop('tasks')[1].decode('utf-8')
+            if file_handler.exists(file_name):
+                data = read_file(file_name)
+                results = future(data)
+                client.rpush('answers', results.result())
+            else:
+                print(f'File {file_name} not found')
 
 file_handler=LocalFileHandler() #and/or RemoteFileHandler
+client_dask = Client(processes=False, n_workers=4)
+print(client_dask)
+print('Dashboard workers: ' + client_dask.dashboard_link)
 
-with redis.Redis() as client:
-    while True:
-        file_name = client.brpop('tasks')[1].decode('utf-8')
-        if file_handler.exists(file_name):
-            data = file_handler.read(file_name)
-            result = get_file(data)
-            print(result)
-            client.rpush('answers', result)
-        else:
-            print('File '+file_name+' not found')
+if __name__ == "__main__":
+    main()
